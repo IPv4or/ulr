@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const axios = require('axios');
+const crypto = require('crypto');
 
 // Models imports
 const User = require('./models/User');
@@ -18,33 +19,17 @@ const Appointment = require('./models/Appointment');
 const app = express();
 
 // --- SECURITY MIDDLEWARE ---
-
-// Set Security Headers
-app.use(helmet({
-    contentSecurityPolicy: false, // Disabled to allow inline scripts/styles in this SPA structure
-}));
-
-// Rate Limiting (100 requests per 10 mins)
+app.use(helmet({ contentSecurityPolicy: false }));
 const limiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     max: 100,
-    message: 'Too many requests from this IP, please try again later.'
+    message: 'Too many requests, please try again later.'
 });
 app.use('/api', limiter);
-
-// Prevent Parameter Pollution
 app.use(hpp());
-
-// Data Sanitization against NoSQL query injection
 app.use(mongoSanitize());
-
-// CORS
 app.use(cors());
-
-// Body Parser
 app.use(express.json());
-
-// Serve Static Files (Frontend)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // --- DB CONNECTION ---
@@ -52,13 +37,20 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/ulr')
     .then(() => console.log('MongoDB Connected'))
     .catch(err => console.log(err));
 
+// --- HELPERS ---
+const generateHandle = (name) => {
+    // "My Schedule" -> "my-schedule-a1b2"
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    const suffix = crypto.randomBytes(2).toString('hex'); 
+    return `${slug}-${suffix}`;
+};
+
 // --- AUTH MIDDLEWARE ---
 const protect = async (req, res, next) => {
     let token;
     if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
         token = req.headers.authorization.split(' ')[1];
     }
-    
     if (!token) return res.status(401).json({ msg: 'Not authorized' });
 
     try {
@@ -72,21 +64,22 @@ const protect = async (req, res, next) => {
 
 // --- ROUTES ---
 
-// 1. Auth: Register
+// 1. Auth: Register (UPDATED)
 app.post('/api/auth/register', async (req, res) => {
-    const { name, email, password, handle } = req.body;
+    // "scheduleName" replaces "name", handle is auto-generated
+    const { scheduleName, email, password } = req.body;
     try {
         let user = await User.findOne({ email });
         if (user) return res.status(400).json({ msg: 'User already exists' });
         
-        const handleCheck = await User.findOne({ handle });
-        if (handleCheck) return res.status(400).json({ msg: 'Handle taken' });
+        const handle = generateHandle(scheduleName);
 
-        user = await User.create({ name, email, password, handle });
+        user = await User.create({ name: scheduleName, email, password, handle });
         
         const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.status(201).json({ token, user: { id: user._id, name: user.name, handle: user.handle } });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ msg: 'Server error' });
     }
 });
@@ -108,7 +101,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// 3. Public Profile & Availability
+// 3. Public Profile
 app.get('/api/p/:handle', async (req, res) => {
     try {
         const user = await User.findOne({ handle: req.params.handle }).select('-password -email');
@@ -142,7 +135,7 @@ app.post('/api/appointments', async (req, res) => {
     }
 });
 
-// 5. Dashboard Data (Protected)
+// 5. Dashboard Data
 app.get('/api/dashboard', protect, async (req, res) => {
     try {
         const appointments = await Appointment.find({ providerId: req.user._id }).sort({ startTime: 1 });
@@ -152,7 +145,7 @@ app.get('/api/dashboard', protect, async (req, res) => {
     }
 });
 
-// 6. Invisible AI Optimization (DeepSeek)
+// 6. AI Optimization
 app.post('/api/optimize', protect, async (req, res) => {
     try {
         const appointments = await Appointment.find({ 
@@ -167,12 +160,11 @@ app.post('/api/optimize', protect, async (req, res) => {
         const scheduleData = appointments.map(a => `${a.startTime} - ${a.customerName}`).join('\n');
         
         const prompt = `
-        Here is a professional's schedule:
+        Here is a schedule:
         ${scheduleData}
         
-        Identify the most cluttered day and suggest a specific 1-hour "Deep Focus Block" that should be marked as busy to prevent burnout. 
-        Return ONLY a JSON string like: {"date": "YYYY-MM-DD", "time": "HH:MM", "reason": "High density of meetings"}
-        Do not include markdown formatting.
+        Suggest a specific 1-hour "Deep Focus Block" to prevent burnout. 
+        Return ONLY a JSON string: {"date": "YYYY-MM-DD", "time": "HH:MM", "reason": "reason"}
         `;
 
         const response = await axios.post('https://api.deepseek.com/chat/completions', {
@@ -192,7 +184,6 @@ app.post('/api/optimize', protect, async (req, res) => {
         res.json({ suggestion: aiContent });
 
     } catch (err) {
-        console.error("AI Error:", err.message);
         res.status(500).json({ msg: 'Optimization failed' });
     }
 });
